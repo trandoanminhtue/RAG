@@ -1,0 +1,19 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# Environment variables
+.env
+.env.*
+!.env.example
+
+# Vector DB / Local storage generated at runtime
+faiss_index/
+*.index
+*.pkl
+
+# Test Data
+paper/samples/*
+!paper/samples/.gitkeep
