@@ -15,5 +15,5 @@ faiss_index/
 *.pkl
 
 # Test Data
-paper/samples/*
+paper/samples/
 !paper/samples/.gitkeep
