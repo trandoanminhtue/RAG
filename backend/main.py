@@ -1,7 +1,7 @@
 import os
 from dotenv import load_dotenv
 import uuid
-from fastapi import APIRouter, UploadFile, File, HTTPException
+from fastapi import APIRouter, UploadFile, File, HTTPException, FastAPI
 
 # Document Loaders & Splitters
 from langchain_community.document_loaders import PyPDFLoader
@@ -20,7 +20,7 @@ from qdrant_client.http import models
 from minio import Minio
 import tempfile
 import psycopg2
-from backend.database.model import create_tables
+from database.model import create_tables
 import pika
 from io import BytesIO
 
@@ -37,7 +37,7 @@ load_dotenv()
 #QDRANT
 QDRANT_HOST = os.getenv("QDRANT_HOST", "localhost")
 QDRANT_PORT = int(os.getenv("QDRANT_PORT", 6333))
-COLLECTION_NAME = "pdf_documents"
+COLLECTION_NAME = str(os.getenv("COLLECTION_NAME", "pdf_documents"))
 
 #POSTGRESQL
 POSTGRES_HOST = os.getenv("POSTGRES_HOST", "localhost")
@@ -47,10 +47,11 @@ POSTGRES_USER = os.getenv("POSTGRES_USER", "postgres")
 POSTGRES_PASSWORD = os.getenv("POSTGRES_PASSWORD", "postgres")
 
 #MINIO
-MINIO_ENDPOINT = os.getenv("MINIO_ENDPOINT", "localhost:9000")
+MINIO_HOST = os.getenv("MINIO_HOST", "localhost")
+MINIO_PORT = int(os.getenv("MINIO_PORT", 9000))
 MINIO_ACCESS_KEY = os.getenv("MINIO_ROOT_USER", "minioadmin")
 MINIO_SECRET_KEY = os.getenv("MINIO_ROOT_PASSWORD", "minioadmin")
-BUCKET_NAME = "documents"
+BUCKET_NAME = str(os.getenv("BUCKET_NAME", "documents"))
 
 #RABBITMQ
 RABBITMQ_HOST = os.getenv("RABBITMQ_HOST", "localhost")
@@ -59,6 +60,7 @@ RABBITMQ_USER = os.getenv("RABBITMQ_USER", "guest")
 RABBITMQ_PASS = os.getenv("RABBITMQ_PASSWORD", "guest")
 
 router = APIRouter()
+app = FastAPI()
 # Khởi tạo
 
 ## Qdrant
@@ -76,7 +78,7 @@ if not qdrant_client.collection_exists(COLLECTION_NAME):
 
 ## MinIO
 minio_client = Minio(
-    endpoint=MINIO_ENDPOINT,
+    endpoint=f"{MINIO_HOST}:{MINIO_PORT}",
     access_key=MINIO_ACCESS_KEY,
     secret_key=MINIO_SECRET_KEY,
     secure=False
@@ -422,5 +424,3 @@ rag_chain = (
     | RunnableLambda(save_ans)
     | (lambda x: x["answer"])
 )
-
-if __name__ == "__main__":
