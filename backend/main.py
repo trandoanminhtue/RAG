@@ -1,5 +1,7 @@
 import os
 from dotenv import load_dotenv
+import uuid
+from fastapi import APIRouter, UploadFile, File, HTTPException
 
 # Document Loaders & Splitters
 from langchain_community.document_loaders import PyPDFLoader
@@ -20,11 +22,12 @@ import tempfile
 import psycopg2
 from backend.database.model import create_tables
 import pika
+from io import BytesIO
 
 # Chain & Prompts
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.output_parsers import StrOutputParser
-from langchain_core.runnables import RunnablePassthrough
+from langchain_core.runnables import RunnableParallel, RunnablePassthrough, RunnableLambda
 from langchain_core.documents import Document
 
 load_dotenv()
@@ -47,6 +50,7 @@ POSTGRES_PASSWORD = os.getenv("POSTGRES_PASSWORD", "postgres")
 MINIO_ENDPOINT = os.getenv("MINIO_ENDPOINT", "localhost:9000")
 MINIO_ACCESS_KEY = os.getenv("MINIO_ROOT_USER", "minioadmin")
 MINIO_SECRET_KEY = os.getenv("MINIO_ROOT_PASSWORD", "minioadmin")
+BUCKET_NAME = "documents"
 
 #RABBITMQ
 RABBITMQ_HOST = os.getenv("RABBITMQ_HOST", "localhost")
@@ -54,9 +58,10 @@ RABBITMQ_PORT = int(os.getenv("RABBITMQ_PORT", 5672))
 RABBITMQ_USER = os.getenv("RABBITMQ_USER", "guest")
 RABBITMQ_PASS = os.getenv("RABBITMQ_PASSWORD", "guest")
 
+router = APIRouter()
 # Khởi tạo
 
-# Qdrant
+## Qdrant
 qdrant_client = QdrantClient(host=QDRANT_HOST, port=QDRANT_PORT)
 
 if not qdrant_client.collection_exists(COLLECTION_NAME):
@@ -69,7 +74,7 @@ if not qdrant_client.collection_exists(COLLECTION_NAME):
     )
     print(f"đã khai báo xong collection '{COLLECTION_NAME} của qdrant")
 
-# MinIO
+## MinIO
 minio_client = Minio(
     endpoint=MINIO_ENDPOINT,
     access_key=MINIO_ACCESS_KEY,
@@ -77,11 +82,11 @@ minio_client = Minio(
     secure=False
 )
 
-if not minio_client.bucket_exists("documents"):
-    minio_client.make_bucket("documents")
-    print("Đã khai báo xong bucket minIO: documents")
+if not minio_client.bucket_exists(BUCKET_NAME):
+    minio_client.make_bucket(BUCKET_NAME)
+    print(f"Đã khai báo xong bucket minIO: {BUCKET_NAME}")
 
-# RabbitMQ
+## RabbitMQ
 credentials = pika.PlainCredentials(RABBITMQ_USER, RABBITMQ_PASS)
 parameters = pika.ConnectionParameters(
     host=RABBITMQ_HOST,
@@ -97,7 +102,7 @@ QUEUE_NAME = "task_queue"
 print(f"✅ Đã khai báo xong Queue: '{QUEUE_NAME}'")
 connection.close()
 
-# POSTGRESQL
+## POSTGRESQL
 def get_db():
     return psycopg2.connect(
         host=POSTGRES_HOST,
@@ -123,7 +128,8 @@ def init_db():
         cursor.close()
         conn.close()
 
-# luồng admin
+#  luồng admin
+## biến
 EMBEDDING_MODEL = os.getenv("EMBEDDING_MODEL", "bge-m3")
 embeddings = OllamaEmbeddings(model=EMBEDDING_MODEL)
 
@@ -133,52 +139,101 @@ vectorstore = QdrantVectorStore(
     embedding=embeddings
 )
 
-def ULminIO(file_path: str, document_id: str):
-    minio_client.fput_object(
-        bucket_name="documents",
-        object_name=document_id,
-        file_path=file_path
-    )
-    conn = get_db()
-    cursor = conn.cursor()
-    cursor.execute("""
-        INSERT INTO documents (
-            id, 
-            user_id,
-            file_name, 
-            file_size_bytes, 
-            minio_bucket, 
-            minio_object_name, 
-            status
-        )
-        VALUES (%s, %s, %s, %s, %s, %s, 'PENDING')
-        ON CONFLICT (id) DO UPDATE 
-        SET status = 'PENDING',
-            updated_at = CURRENT_TIMESTAMP;
-    """)
-    conn.commit()
-    conn.close()
-    print("lưu thành công file "f"{document_id} vào MinIO")
-
-MARKDOWN_SEPARATORS = [
-    "\n#{1,6} ",
-    "```\n",
-    "\n\\*\\*\\*+\n",
-    "\n---+\n",
-    "\n___+\n",
-    "\n\n",
-    "\n",
-    " ",
-    "",
-]
-
 text_splitter = RecursiveCharacterTextSplitter(
     chunk_size=1200,
     chunk_overlap=200,
     add_start_index=True,
     strip_whitespace=True,
-    separators=MARKDOWN_SEPARATORS,
 )
+
+## hàm
+def upload_minIO(document_id: str, file_size: int, content: bytes):
+    minio_client.put_object(
+        bucket_name=BUCKET_NAME,
+        object_name=document_id,
+        data=BytesIO(content),
+        length=file_size,
+        content_type="application/pdf",
+    )
+    print(
+        f"Upload completed: "
+        f"{document_id} -> MinIO/{BUCKET_NAME}"
+    )
+
+def update_status(document_id: str, file_name: str, file_size_bytes: int):
+    conn = get_db()
+    try:
+        cursor = conn.cursor()
+        cursor.execute(
+            """
+            INSERT INTO documents (
+                id,
+                file_name,
+                file_size_bytes,
+                minio_bucket,
+                status
+            )
+            VALUES (%s, %s, %s, %s, 'PENDING')
+            ON CONFLICT (id)
+            DO UPDATE SET
+                status = 'PENDING',
+                updated_at = CURRENT_TIMESTAMP;
+            """,
+            (
+                document_id,
+                file_name,
+                file_size_bytes,
+                BUCKET_NAME,
+            ),
+        )
+        conn.commit()
+
+    except Exception:
+        conn.rollback()
+        raise
+
+    finally:
+        cursor.close()
+        conn.close()
+
+    print(
+        f"Document {document_id} "
+        f"đã được tạo với status=PENDING"
+    )
+
+@router.post("/upload")
+async def upload_document(file: UploadFile = File(...)):
+    if file.content_type != "application/pdf":
+        raise HTTPException(status_code=400, detail="Chỉ chấp nhận file PDF")
+
+    content = await file.read()
+    file_size = len(content)
+    file_name = file.filename
+    if file_size == 0:
+        raise HTTPException(status_code=400, detail="File rỗng")
+
+    document_id = str(uuid.uuid4())
+
+    try:
+        upload_minIO(document_id, file_size, content)
+        minio_uploaded = True
+        update_status(document_id, file_name, file_size)
+    except Exception as e:
+        if minio_uploaded:
+            try:
+                minio_client.remove_object(BUCKET_NAME, document_id)
+                print(f"Rollback: Đã xóa dọn rác file {document_id} trên MinIO do DB lỗi.")
+            except Exception as cleanup_error:
+                print(f"Lỗi khi dọn rác MinIO: {cleanup_error}")
+        raise HTTPException(status_code=500, detail=f"Upload thất bại: {e}")
+
+    return {
+        "success": True,
+        "document_id": document_id,
+        "file_name": file_name,
+        "status": "PENDING",
+        "message": f"Đã tải lên {file_name}, đang xử lý",
+    }
 
 def LCE(file_path: str, document_id: str):
     loader = PyPDFLoader(file_path)
@@ -192,40 +247,103 @@ def LCE(file_path: str, document_id: str):
     vectorstore.add_documents(splits)
 
     total_chunks = len(splits)
+
     conn = get_db()
-    cursor = conn.cursor()
-    
     try:
-        query = """
+        cursor = conn.cursor()
+
+        cursor.execute(
+            """
             UPDATE documents
-            SET status = 'COMPLETED',
+            SET
+                status = 'COMPLETED',
                 total_chunks = %s,
                 updated_at = CURRENT_TIMESTAMP
             WHERE id = %s;
-        """
-        cursor.execute(query, (total_chunks, document_id))
+            """,
+            (
+                total_chunks,
+                document_id,
+            ),
+        )
+
         conn.commit()
-        print(f"Lưu thành công {total_chunks} chunks của file {document_id} vào Qdrant")
-    except Exception as e:
+
+    except Exception:
         conn.rollback()
-        print(f"❌Lỗi cập nhật trạng thái: {e}")
-        raise e
+        raise
+
     finally:
         cursor.close()
         conn.close()
 
-def TempMinIO(document_id: str):
-    with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as temp_file:
-        temp_file_path = temp_file.name
+    print(
+        f"Document {document_id} hoàn thành. "
+        f"{total_chunks} chunks -> Qdrant"
+    )
+
+def done_admin(document_id: str):
+    temp_file_path = None
+
     try:
-        minio_client.fget_object("documents", document_id, temp_file_path)
-        
+        with tempfile.NamedTemporaryFile(
+            delete=False,
+            suffix=".pdf",
+        ) as temp_file:
+
+            temp_file_path = temp_file.name
+
+
+        minio_client.fget_object(
+            bucket_name=BUCKET_NAME,
+            object_name=document_id,
+            file_path=temp_file_path,
+        )
+
         LCE(file_path=temp_file_path, document_id=document_id)
-        
+
+    except Exception as e:
+
+        conn = get_db()
+
+        try:
+            cursor = conn.cursor()
+
+            cursor.execute(
+                """
+                UPDATE documents
+                SET
+                    status = 'FAILED',
+                    updated_at = CURRENT_TIMESTAMP
+                WHERE id = %s;
+                """,
+                (document_id,),
+            )
+
+            conn.commit()
+
+        except Exception:
+            conn.rollback()
+            raise
+
+        finally:
+            cursor.close()
+            conn.close()
+
+        print(
+            f"❌ Xử lý document {document_id} thất bại: {e}"
+        )
+
+        raise
+
     finally:
-        if os.path.exists(temp_file_path):
+        if (
+            temp_file_path
+            and os.path.exists(temp_file_path)
+        ):
             os.remove(temp_file_path)
 
+###===============================================================================================================
 # luồng user
 retriever = vectorstore.as_retriever(
     search_type="similarity_score_threshold",
@@ -241,24 +359,68 @@ Context:
 Question: {question}
 
 Answer:"""
-prompt = ChatPromptTemplate.from_template(template)
 
-def format_docs(docs: list[Document]) -> str:
-    return "\n\n".join(d.page_content for d in docs)
+prompt = ChatPromptTemplate.from_template(template)
 
 LLM_MODEL = "qwen2.5:7b"
 llm = ChatOllama(model=LLM_MODEL, temperature=0)
 
-# RAG chain
-rag_chain = (
-    {"context": retriever | format_docs, "question": RunnablePassthrough()}
+def format_docs(docs: list[Document]) -> str:
+    return "\n\n".join(d.page_content for d in docs)
+
+def handle_question(session_id: str, question: str) -> dict:
+    Question = input("Nhập câu hỏi: ")
+
+def save_ans(data: dict) -> dict:
+    question = data["question"]
+    answer = data["answer"]
+    docs = data["context"]
+    
+    conn = get_db()
+    cursor = conn.cursor()
+    ai_message_id = cursor.fetchone()[0]
+
+    for doc in docs:
+        doc_id = doc.metadata.get("document_id")
+
+        if doc_id:
+            cursor.execute("""
+                INSERT INTO message_sources (
+                    message_id, 
+                    document_id, 
+                    page_number, 
+                    content_preview
+                )
+                VALUES (%s, %s, %s, %s);
+            """, (
+                    ai_message_id,
+                    doc_id,
+                    doc.metadata.get("page", 1),
+                    doc.page_content[:200]
+                ))
+            
+        conn.commit()
+        cursor.close()
+        conn.close()
+
+    return data
+
+rag_chain_answer = (
+    RunnablePassthrough.assign(context=(lambda x: format_docs(x["context"])))
     | prompt
     | llm
     | StrOutputParser()
 )
 
+rag_chain = (
+    RunnableParallel({
+        "context": (lambda x: x["question"]) | retriever,
+        "question": lambda x: x["question"],
+        "session_id": lambda x: x["session_id"]
+    })
+    .assign(answer=rag_chain_answer)
+    | RunnableLambda(save_ans)
+    | (lambda x: x["answer"])
+)
+
 if __name__ == "__main__":
-    LCE("path/to/your/file.pdf", "document_1")
-    question = input("Question: ")
-    answer = rag_chain.invoke(question)
-    print("Answer:", answer)

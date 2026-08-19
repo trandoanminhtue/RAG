@@ -17,17 +17,16 @@ def create_tables(cursor):
         END $$;
     """)
 
-    # 1. Bảng user
+    # Bảng user
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS users (
             id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
-            email VARCHAR(255) UNIQUE NOT NULL,
             full_name VARCHAR(255),
             created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
         );
     """)
 
-    # 2. Bảng trạng thái
+    # Bảng trạng thái
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS documents (
             id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
@@ -36,7 +35,6 @@ def create_tables(cursor):
             file_size_bytes BIGINT NOT NULL,
             mime_type VARCHAR(100) DEFAULT 'application/pdf',
             minio_bucket VARCHAR(100) NOT NULL,
-            minio_object_name VARCHAR(500) NOT NULL,
             status document_status DEFAULT 'PENDING',
             error_message TEXT,
             total_chunks INT DEFAULT 0,
@@ -45,7 +43,7 @@ def create_tables(cursor):
         );
     """)
 
-    # 3. Bảng đoạn chat
+    # Bảng đoạn chat
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS chat_sessions (
             id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
@@ -56,7 +54,7 @@ def create_tables(cursor):
         );
     """)
 
-    # 4. Bảng tin nhắn
+    # Bảng tin nhắn
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS chat_messages (
             id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
@@ -68,7 +66,7 @@ def create_tables(cursor):
         );
     """)
 
-    # 5. Bảng src
+    # Bảng src
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS message_sources (
             id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
@@ -82,7 +80,7 @@ def create_tables(cursor):
         );
     """)
 
-    # 6. Tạo Indexes tối ưu hiệu năng truy vấn
+    # Tạo Indexes tối ưu hiệu năng truy vấn
     cursor.execute("""
         CREATE INDEX IF NOT EXISTS idx_documents_user_id ON documents(user_id);
         CREATE INDEX IF NOT EXISTS idx_documents_status ON documents(status);
