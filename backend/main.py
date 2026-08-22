@@ -31,7 +31,6 @@ from langchain_core.runnables import RunnableParallel, RunnablePassthrough, Runn
 from langchain_core.documents import Document
 
 load_dotenv()
-
 # Config
 
 #QDRANT
@@ -65,17 +64,18 @@ app = FastAPI()
 
 ## Qdrant
 qdrant_client = QdrantClient(host=QDRANT_HOST, port=QDRANT_PORT)
-
-if not qdrant_client.collection_exists(COLLECTION_NAME):
-    qdrant_client.create_collection(
-        collection_name=COLLECTION_NAME,
-        vectors_config=models.VectorParams(
-            size=1024,
-            distance=models.Distance.COSINE
-        )
+def init_qdrant():
+    if not qdrant_client.collection_exists(COLLECTION_NAME):
+        qdrant_client.create_collection(
+            collection_name=COLLECTION_NAME,
+            vectors_config=models.VectorParams(
+                size=1024,
+                distance=models.Distance.COSINE
+            )
     )
-    print(f"đã khai báo xong collection '{COLLECTION_NAME} của qdrant")
+    print(f"✅ kết nối thành công qdrant; collection: '{COLLECTION_NAME}'")
 
+init_qdrant()
 ## MinIO
 minio_client = Minio(
     endpoint=f"{MINIO_HOST}:{MINIO_PORT}",
@@ -84,9 +84,12 @@ minio_client = Minio(
     secure=False
 )
 
-if not minio_client.bucket_exists(BUCKET_NAME):
-    minio_client.make_bucket(BUCKET_NAME)
-    print(f"Đã khai báo xong bucket minIO: {BUCKET_NAME}")
+def init_minio_bucket():
+    if not minio_client.bucket_exists(BUCKET_NAME):
+        minio_client.make_bucket(BUCKET_NAME)
+    print(f"✅ kết nối thành công minIO; bucket: {BUCKET_NAME}")
+
+init_minio_bucket()
 
 ## RabbitMQ
 credentials = pika.PlainCredentials(RABBITMQ_USER, RABBITMQ_PASS)
@@ -96,13 +99,15 @@ parameters = pika.ConnectionParameters(
     credentials=credentials
 )
 
-connection = pika.BlockingConnection(parameters)
-channel = connection.channel()
-
 QUEUE_NAME = "task_queue"
 
-print(f"✅ Đã khai báo xong Queue: '{QUEUE_NAME}'")
-connection.close()
+def init_rabbit():
+    connection = pika.BlockingConnection(parameters)
+    channel = connection.channel()
+    channel.queue_declare(queue=QUEUE_NAME, durable=True)
+    print(f"✅ Kết nối thành công rabbitMQ; Queue: '{QUEUE_NAME}'")
+    connection.close()
+init_rabbit()
 
 ## POSTGRESQL
 def get_db():
@@ -121,14 +126,16 @@ def init_db():
     try:
         create_tables(cursor)
         conn.commit()
-        print("✅ Khởi tạo Database thành công")
+        print("✅ Kết nối thành công database postgresql")
     except Exception as e:
         conn.rollback()
-        print(f"❌ Lỗi khởi tạo Database: {e}")
+        print(f"❌ Lỗi kết nối Database: {e}")
         raise e
     finally:
         cursor.close()
         conn.close()
+
+init_db()
 
 #  luồng admin
 ## biến
@@ -150,6 +157,8 @@ text_splitter = RecursiveCharacterTextSplitter(
 
 ## hàm
 def upload_minIO(document_id: str, file_size: int, content: bytes):
+    print(f"[DEBUG] file_size nhận được: {file_size}")
+    print(f"[DEBUG] Bắt đầu put_object...")
     minio_client.put_object(
         bucket_name=BUCKET_NAME,
         object_name=document_id,
@@ -157,12 +166,13 @@ def upload_minIO(document_id: str, file_size: int, content: bytes):
         length=file_size,
         content_type="application/pdf",
     )
+    print(f"[DEBUG] put_object hoàn tất")
     print(
         f"Upload completed: "
         f"{document_id} -> MinIO/{BUCKET_NAME}"
     )
 
-def update_status(document_id: str, file_name: str, file_size_bytes: int):
+def update_status_DB(document_id: str, file_name: str, file_size_bytes: int):
     conn = get_db()
     try:
         cursor = conn.cursor()
@@ -203,8 +213,24 @@ def update_status(document_id: str, file_name: str, file_size_bytes: int):
         f"đã được tạo với status=PENDING"
     )
 
+def send_mes(document_id: str):
+    connection = pika.BlockingConnection(parameters)
+    channel = connection.channel()
+    channel.queue_declare(queue=QUEUE_NAME, durable=True)
+
+    channel.basic_publish(
+        exchange="",
+        routing_key=QUEUE_NAME,
+        body=document_id.encode("utf-8"),
+        properties=pika.BasicProperties(
+            delivery_mode=2,
+        ),
+    )
+    print(f"✅ Đã gửi task '{document_id}' vào queue '{QUEUE_NAME}'")
+    connection.close()
+
 @router.post("/upload")
-async def upload_document(file: UploadFile = File(...)):
+async def upload_doc(file: UploadFile = File(...)):
     if file.content_type != "application/pdf":
         raise HTTPException(status_code=400, detail="Chỉ chấp nhận file PDF")
 
@@ -219,7 +245,8 @@ async def upload_document(file: UploadFile = File(...)):
     try:
         upload_minIO(document_id, file_size, content)
         minio_uploaded = True
-        update_status(document_id, file_name, file_size)
+        update_status_DB(document_id, file_name, file_size)
+        send_mes(document_id)
     except Exception as e:
         if minio_uploaded:
             try:
@@ -280,7 +307,7 @@ def LCE(file_path: str, document_id: str):
         conn.close()
 
     print(
-        f"Document {document_id} hoàn thành. "
+        f"✅ Document {document_id} embedding thành công. "
         f"{total_chunks} chunks -> Qdrant"
     )
 
@@ -424,3 +451,5 @@ rag_chain = (
     | RunnableLambda(save_ans)
     | (lambda x: x["answer"])
 )
+
+app.include_router(router)
