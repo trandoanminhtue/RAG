@@ -12,7 +12,7 @@ def create_tables(cursor):
     cursor.execute("""
         DO $$ BEGIN
             IF NOT EXISTS (SELECT 1 FROM pg_type WHERE typname = 'message_role') THEN
-                CREATE TYPE message_role AS ENUM ('user', 'assistant', 'system');
+                CREATE TYPE message_role AS ENUM ('user', 'agent');
             END IF;
         END $$;
     """)
@@ -25,6 +25,12 @@ def create_tables(cursor):
             created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
         );
     """)
+
+    cursor.execute("""
+            INSERT INTO users (id, full_name)
+            VALUES (%s, %s)
+            ON CONFLICT (id) DO NOTHING;
+        """, ("a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11", "una"))
 
     # Bảng trạng thái
     cursor.execute("""
@@ -66,24 +72,9 @@ def create_tables(cursor):
         );
     """)
 
-    # Bảng src
-    cursor.execute("""
-        CREATE TABLE IF NOT EXISTS message_sources (
-            id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
-            message_id UUID NOT NULL REFERENCES chat_messages(id) ON DELETE CASCADE,
-            document_id UUID NOT NULL REFERENCES documents(id) ON DELETE CASCADE,
-            qdrant_point_id VARCHAR(255),
-            page_number INT,
-            score FLOAT,
-            content_preview TEXT,
-            created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
-        );
-    """)
-
     # Tạo Indexes tối ưu hiệu năng truy vấn
     cursor.execute("""
         CREATE INDEX IF NOT EXISTS idx_documents_user_id ON documents(user_id);
         CREATE INDEX IF NOT EXISTS idx_documents_status ON documents(status);
         CREATE INDEX IF NOT EXISTS idx_chat_messages_session_id ON chat_messages(session_id, created_at ASC);
-        CREATE INDEX IF NOT EXISTS idx_message_sources_message_id ON message_sources(message_id);
     """)

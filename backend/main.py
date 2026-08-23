@@ -2,6 +2,10 @@ import os
 from dotenv import load_dotenv
 import uuid
 from fastapi import APIRouter, UploadFile, File, HTTPException, FastAPI
+import json
+from pydantic import BaseModel
+from typing import Optional
+import time
 
 # Document Loaders & Splitters
 from langchain_community.document_loaders import PyPDFLoader
@@ -376,80 +380,184 @@ def done_admin(document_id: str):
 # luồng user
 retriever = vectorstore.as_retriever(
     search_type="similarity_score_threshold",
-    search_kwargs={"k": 5, "score_threshold": 0.2}
+    search_kwargs={"k": 5,
+                   "score_threshold": 0.2
+    },
 )
-
-template = """You are a secretary. Use ONLY the context below to answer the question.
-If the answer is not contained in the context, say you don't know.
-
-Context:
-{context}
-
-Question: {question}
-
-Answer:"""
-
-prompt = ChatPromptTemplate.from_template(template)
-
-LLM_MODEL = "qwen2.5:7b"
-llm = ChatOllama(model=LLM_MODEL, temperature=0)
 
 def format_docs(docs: list[Document]) -> str:
     return "\n\n".join(d.page_content for d in docs)
 
-def handle_question(session_id: str, question: str) -> dict:
-    Question = input("Nhập câu hỏi: ")
+template = """
+Bạn là một trợ lý AI chuyên nghiệp. Hãy trả lời câu hỏi của người dùng DỰA TRÊN ngữ cảnh được cung cấp dưới đây.
 
-def save_ans(data: dict) -> dict:
-    question = data["question"]
-    answer = data["answer"]
-    docs = data["context"]
-    
+YÊU CẦU BẮT BUỘC:
+1. Luôn luôn trả lời bằng **Tiếng Việt**.
+2. Nếu ngữ cảnh chứa ngôn ngữ khác (Tiếng Anh, Tiếng Trung...), hãy tự dịch và tổng hợp lại bằng Tiếng Việt.
+3. Nếu không tìm thấy thông tin trong ngữ cảnh, hãy trả lời: "Tôi không tìm thấy thông tin này trong tài liệu."
+
+Ngữ cảnh (Context):
+{context}
+
+Câu hỏi:
+{question}
+
+Trả lời:
+"""
+
+prompt = ChatPromptTemplate.from_template(template)
+
+LLM_MODEL = "qwen2.5:3b"
+
+llm = ChatOllama(
+    model=LLM_MODEL,
+    temperature=0
+)
+
+class NewChatRequest(BaseModel):
+    user_id: str
+    title: Optional[str] = None
+
+class AskRequest(BaseModel):
+    session_id: str
+    user_id: str
+    content: str
+
+chain = (
+    prompt | llm | StrOutputParser()
+)
+
+def process(question: str):
+    t0 = time.time()
+    docs: list[Document] = retriever.invoke(question)
+    t1 = time.time()
+    print(f"⏱️ Retrieval mất: {t1 - t0:.2f}s")
+    context_text = format_docs(docs)
+
+    citations = [
+        {
+            "id": doc.metadata.get("document_id"),
+            "page": doc.metadata.get("page", None),
+            "title": doc.metadata.get("title"),
+            "snippet": doc.page_content[:200]
+        }
+        for doc in docs
+    ]
+
+    answer = chain.invoke({
+        "context": context_text,
+        "question": question
+    })
+    t2 = time.time()
+    print(f"⏱️ LLM Generate mất: {t2 - t1:.2f}s")
+    return {
+        "answer": answer,
+        "citations": citations
+    }
+
+def save(session_id: str, question: str, answer: str, citations: list) -> None:
     conn = get_db()
     cursor = conn.cursor()
-    ai_message_id = cursor.fetchone()[0]
 
-    for doc in docs:
-        doc_id = doc.metadata.get("document_id")
+    try:
+        cursor.execute(
+            """
+            INSERT INTO chat_messages (
+                session_id,
+                role,
+                content
+            )
+            VALUES (%s, 'user', %s)
+            """,
+            (
+                session_id,
+                question,
+            )
+        )
 
-        if doc_id:
-            cursor.execute("""
-                INSERT INTO message_sources (
-                    message_id, 
-                    document_id, 
-                    page_number, 
-                    content_preview
-                )
-                VALUES (%s, %s, %s, %s);
-            """, (
-                    ai_message_id,
-                    doc_id,
-                    doc.metadata.get("page", 1),
-                    doc.page_content[:200]
-                ))
-            
+        cursor.execute(
+            """
+            INSERT INTO chat_messages (
+                session_id,
+                role,
+                content,
+                metadata
+            )
+            VALUES (%s, 'agent', %s, %s)
+            """,
+            (
+                session_id,
+                answer,
+                json.dumps(citations)
+            )
+        )
         conn.commit()
+        print(f"✅ đã lưu câu hỏi và câu trả lời mới của {session_id}")
+
+    except Exception as e:
+        conn.rollback()
+        print(f"❌ Lỗi khi lưu vào Database: {e}")
+        raise e
+
+    finally:
         cursor.close()
         conn.close()
 
-    return data
+    
 
-rag_chain_answer = (
-    RunnablePassthrough.assign(context=(lambda x: format_docs(x["context"])))
-    | prompt
-    | llm
-    | StrOutputParser()
-)
+@router.post("/new_chat")
+def new_chat(payload: NewChatRequest):
+    session_id = str(uuid.uuid4())
+    chat_title = payload.title if payload.title else "Cuộc trò chuyện mới"
 
-rag_chain = (
-    RunnableParallel({
-        "context": (lambda x: x["question"]) | retriever,
-        "question": lambda x: x["question"],
-        "session_id": lambda x: x["session_id"]
-    })
-    .assign(answer=rag_chain_answer)
-    | RunnableLambda(save_ans)
-    | (lambda x: x["answer"])
-)
+    conn = get_db()
+    cursor = conn.cursor()
+    try:
+        cursor.execute(
+            """
+            INSERT INTO chat_sessions (id, user_id, title)
+            VALUES (%s, %s, %s);
+            """,
+            (session_id, payload.user_id, chat_title)
+        )
+        conn.commit()
+    except Exception as e:
+        conn.rollback()
+        raise HTTPException(status_code=500, detail=f"Không thể tạo đoạn chat mới: {str(e)}")
+    finally:
+        cursor.close()
+        conn.close()
+
+    return {
+        "session_id": session_id,
+        "user_id": payload.user_id,
+        "title": chat_title
+    }
+
+
+@router.post("/ask")
+def ask(payload: AskRequest):
+    print("✅ Đã nhận request, bắt đầu xử lý RAG...")
+    rag_result = process(question=payload.content)
+    print("✅ Đã xử lý RAG xong, chuẩn bị lưu DB...")
+    answer = rag_result["answer"]
+    citations = rag_result["citations"]
+
+    try:
+        save(
+            session_id=payload.session_id,
+            question=payload.content,
+            answer=answer,
+            citations=citations
+        )
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Lỗi khi lưu dữ liệu hội thoại: {str(e)}")
+
+    return {
+        "session_id": payload.session_id,
+        "question": payload.content,
+        "answer": answer,
+        "citations": citations
+    }
 
 app.include_router(router)
